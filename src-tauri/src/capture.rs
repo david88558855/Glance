@@ -66,24 +66,87 @@ pub struct CapturedScreenImage {
 /// Find the monitor that the cursor is currently on.
 #[cfg(not(target_os = "macos"))]
 pub fn find_cursor_monitor() -> AppResult<CursorMonitorResult> {
-    let (cursor_x, cursor_y) = get_cursor_position()
-        .map_err(|e| AppError::Capture(format!("failed to get cursor position: {e}")))?;
+    let t0 = std::time::Instant::now();
+    // Wayland deliberately hides the global pointer position, and the X server can
+    // also be unreachable in a headless session. Falling back to the primary
+    // display keeps a single-screen capture working instead of aborting the flow.
+    let resolved = get_cursor_position().and_then(|(x, y)| screen_at_pointer(x, y));
+    let result = match resolved {
+        Ok(screen) => Ok(CursorMonitorResult {
+            monitor: monitor_info(&screen),
+            screen,
+        }),
+        Err(err) => {
+            tracing::warn!("cursor monitor unavailable ({err}); using the primary display");
+            find_primary_screen()
+        }
+    };
+    tracing::info!("[PERF][capture] find_cursor_monitor: {:?}", t0.elapsed());
+    result
+}
 
-    // Screen::from_point finds the screen containing the given point
-    let screen = CaptureScreen::from_point(cursor_x, cursor_y)
-        .map_err(|e| AppError::Capture(format!("no screen at cursor ({cursor_x},{cursor_y}): {e}")))?;
+/// Find the display whose physical rectangle contains a pointer position.
+#[cfg(target_os = "windows")]
+fn screen_at_pointer(x: i32, y: i32) -> Result<CaptureScreen, String> {
+    // Windows reports both the pointer and the display geometry in physical pixels.
+    CaptureScreen::from_point(x, y)
+        .map_err(|e| format!("no screen at cursor ({x},{y}): {e}"))
+}
 
-    let info = &screen.display_info;
-    Ok(CursorMonitorResult {
-        screen,
-        monitor: MonitorInfo {
-            scale_factor: info.scale_factor as f64,
-            x: info.x,
-            y: info.y,
-            width: info.width,
-            height: info.height,
-        },
+/// Find the display whose physical rectangle contains a pointer position.
+#[cfg(target_os = "linux")]
+fn screen_at_pointer(x: i32, y: i32) -> Result<CaptureScreen, String> {
+    // XQueryPointer answers in physical root coordinates, while `display-info`
+    // divides its geometry by each display's own scale factor. Compare against the
+    // re-scaled physical rects instead of converting the point, so mixed-DPI setups
+    // pick the display that actually contains the cursor.
+    let screens = CaptureScreen::all().map_err(|e| e.to_string())?;
+    let rects = screens
+        .iter()
+        .map(|screen| {
+            let info = &screen.display_info;
+            let scale = info.scale_factor;
+            (
+                (info.x as f32 * scale) as i32,
+                (info.y as f32 * scale) as i32,
+                (info.width as f32 * scale) as u32,
+                (info.height as f32 * scale) as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    let index = display_index_at_pointer(&rects, x, y)
+        .ok_or_else(|| format!("no display contains the pointer ({x},{y})"))?;
+    screens
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| format!("display {index} disappeared"))
+}
+
+/// Index of the physical display rectangle containing the point.
+/// Split out from `screen_at_pointer` so the mapping can be unit-tested anywhere.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn display_index_at_pointer(rects: &[(i32, i32, u32, u32)], x: i32, y: i32) -> Option<usize> {
+    rects.iter().position(|(rx, ry, rw, rh)| {
+        let right = *rx as i64 + *rw as i64;
+        let bottom = *ry as i64 + *rh as i64;
+        (x as i64) >= *rx as i64
+            && (x as i64) < right
+            && (y as i64) >= *ry as i64
+            && (y as i64) < bottom
     })
+}
+
+/// Build the app-facing monitor description from a captured screen.
+#[cfg(not(target_os = "macos"))]
+fn monitor_info(screen: &CaptureScreen) -> MonitorInfo {
+    let info = &screen.display_info;
+    MonitorInfo {
+        scale_factor: info.scale_factor as f64,
+        x: info.x,
+        y: info.y,
+        width: info.width,
+        height: info.height,
+    }
 }
 
 /// Find the monitor that the cursor is currently on.
@@ -255,59 +318,29 @@ fn get_cursor_position() -> Result<(i32, i32), String> {
 
 #[cfg(target_os = "linux")]
 fn get_cursor_position() -> Result<(i32, i32), String> {
-    // On Linux X11, use XQueryPointer to get cursor position.
-    // Fall back to (0, 0) which will resolve to the primary display.
-    // Wayland does not expose global cursor coordinates; from_point
-    // will still find a valid display.
-    #[cfg(feature = "x11")]
-    {
-        // Attempt X11 if available
-        use std::ffi::c_void;
-        use std::ptr;
+    // The global pointer position only exists under X11/XWayland; native Wayland
+    // deliberately does not expose it, so the caller falls back to the primary
+    // display there. Coordinates are returned in physical root pixels.
+    use xcb::x;
 
-        extern "C" {
-            fn XOpenDisplay(name: *const c_void) -> *mut c_void;
-            fn XCloseDisplay(display: *mut c_void);
-            fn XDefaultRootWindow(display: *mut c_void) -> u64;
-            fn XQueryPointer(
-                display: *mut c_void,
-                window: u64,
-                root_return: *mut u64,
-                child_return: *mut u64,
-                root_x_return: *mut i32,
-                root_y_return: *mut i32,
-                win_x_return: *mut i32,
-                win_y_return: *mut i32,
-                mask_return: *mut u32,
-            ) -> i32;
-        }
+    let (conn, screen_index) = xcb::Connection::connect(None)
+        .map_err(|e| format!("failed to connect to the X server: {e}"))?;
+    let setup = conn.get_setup();
+    let screen = setup
+        .roots()
+        .nth(screen_index as usize)
+        .ok_or_else(|| "X server reported no screen".to_string())?;
 
-        let display = unsafe { XOpenDisplay(ptr::null()) };
-        if display.is_null() {
-            return Err("XOpenDisplay failed".into());
-        }
-        let root = unsafe { XDefaultRootWindow(display) };
-        let mut root_x = 0i32;
-        let mut root_y = 0i32;
-        unsafe {
-            XQueryPointer(
-                display,
-                root,
-                &mut 0u64,
-                &mut 0u64,
-                &mut root_x,
-                &mut root_y,
-                &mut 0i32,
-                &mut 0i32,
-                &mut 0u32,
-            );
-            XCloseDisplay(display);
-        }
-        return Ok((root_x, root_y));
+    let reply = conn
+        .wait_for_reply(conn.send_request(&x::QueryPointer {
+            window: screen.root(),
+        }))
+        .map_err(|e| format!("XQueryPointer failed: {e}"))?;
+    if !reply.same_screen() {
+        return Err("pointer is not on the root screen".into());
     }
 
-    #[allow(unreachable_code)]
-    Err("Linux cursor position not available without x11".into())
+    Ok((reply.root_x() as i32, reply.root_y() as i32))
 }
 
 // ── Screen capture ──────────────────────────────────────────────────────────
@@ -492,7 +525,7 @@ fn virtual_desktop_bounds(monitors: &[(i32, i32, u32, u32)]) -> AppResult<(i32, 
 
 #[cfg(test)]
 mod tests {
-    use super::{physical_display_geometry, virtual_desktop_bounds};
+    use super::{display_index_at_pointer, physical_display_geometry, virtual_desktop_bounds};
 
     #[test]
     fn display_geometry_is_converted_to_physical_pixels() {
@@ -508,6 +541,29 @@ mod tests {
             virtual_desktop_bounds(&[(0, 0, 1920, 1080), (-1280, 0, 1280, 1024), (0, -900, 1600, 900)]).unwrap(),
             (-1280, -900, 3200, 1980)
         );
+    }
+
+    #[test]
+    fn pointer_maps_to_the_display_that_contains_it() {
+        // Left display at 150% (1920x1536 physical), right one at 100% (1920x1080).
+        let rects = [(-1920, 0, 1920, 1536), (0, 0, 1920, 1080)];
+        assert_eq!(display_index_at_pointer(&rects, -1, 10), Some(0));
+        assert_eq!(display_index_at_pointer(&rects, -1920, 1535), Some(0));
+        // The shared boundary belongs to the display that starts there.
+        assert_eq!(display_index_at_pointer(&rects, 0, 0), Some(1));
+        assert_eq!(display_index_at_pointer(&rects, 1919, 1079), Some(1));
+        // Outside every display.
+        assert_eq!(display_index_at_pointer(&rects, 1920, 0), None);
+        assert_eq!(display_index_at_pointer(&rects, 0, 1536), None);
+        assert_eq!(display_index_at_pointer(&rects, -1921, 0), None);
+    }
+
+    #[test]
+    fn pointer_maps_to_vertical_and_negative_displays() {
+        let rects = [(0, 0, 1920, 1080), (0, -900, 1600, 900)];
+        assert_eq!(display_index_at_pointer(&rects, 10, -1), Some(1));
+        assert_eq!(display_index_at_pointer(&rects, 10, -900), Some(1));
+        assert_eq!(display_index_at_pointer(&rects, 10, 0), Some(0));
     }
 }
 
